@@ -1,14 +1,15 @@
 # C:\Users\juanf\Downloads\sweetsol\ss_backend\venv\Scripts
 
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+
 from enum import Enum
+from pydantic import BaseModel
 
 import psycopg as pg
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 import calendar
-
-from pydantic import BaseModel
 
 
 CONN_ARGS = {
@@ -19,6 +20,39 @@ CONN_ARGS = {
     "password": "z9U9HqXfEayEilTHZ1DO9sPiB2dQJsrn"
 }
 
+# CONN_ARGS = {
+#     "host": "localhost",
+#     "port": "5432",
+#     "dbname": "mmontoya",
+#     "user": "postgres",
+#     "password": "postgres"
+# }
+
+MONTHS = [
+    "Ene",
+    "Feb",
+    "Mar",
+    "Abr",
+    "May",
+    "Jun",
+    "Jul",
+    "Ago",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dic"
+]
+
+WEEKDAYS = [
+    "Lun",
+    "Mar",
+    "Mie",
+    "Jue",
+    "Vie",
+    "Sab",
+    "Dom"
+]
+
 
 app = FastAPI()
 app.add_middleware(
@@ -27,6 +61,177 @@ app.add_middleware(
     allow_methods = [ "*" ],
     allow_headers = [ "*" ]
 )
+
+
+@app.get( "/agents" )
+def agents():
+    with pg.connect( **CONN_ARGS ) as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                select * from main.agent
+            """)
+
+            return cur.fetchall()
+
+
+class Client( BaseModel ):
+    name: str
+    lastname: str
+    email: str
+    cty_code: str
+    phone_num: str
+
+@app.post( "/clients" )
+def post_clients( client: Client ):
+    with pg.connect( **CONN_ARGS ) as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                insert into main.client(
+                    name,
+                    lastname,
+                    email,
+                    cty_code,
+                    phone_num
+                ) values(
+                    '{ client.name }',
+                    '{ client.lastname }',
+                    '{ client.email }',
+                    '{ client.cty_code }',
+                    '{ client.phone_num }'
+                )
+            """)
+
+
+@app.post( "/clients/{client_vid}/deposit" )
+def post_client_deposit(
+    client_vid: int,
+    deposit_date: date
+):
+    with pg.connect( **CONN_ARGS ) as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                select count(*)
+                from main.client_milestone cm
+                where cm.client_vid = { client_vid }
+                and cm.milestone_type = 'DEPOSIT'
+            """)
+
+            if( cur.fetchone()[ 0 ] ):
+                raise HTTPException(
+                    status_code = 409,
+                    detail = "Client already has a deposit date"
+                )
+
+            cur.execute(f"""
+                insert into main.client_milestone(
+                    client_vid,
+                    milestone_type,
+                    date
+                ) values(
+                    { client_vid },
+                    'DEPOSIT',
+                    '{ deposit_date }'
+                )
+            """)
+
+
+@app.post( "/clients/{client_vid}/arrival" )
+def post_client_arrival(
+    client_vid: int,
+    arrival_date: date
+):
+    CONTACTS = [ 3, 7, 15, 20, 30, 50, 70, 90, 110, 150, 200 ]
+
+    with pg.connect( **CONN_ARGS ) as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                select count(*)
+                from main.client_milestone cm
+                where cm.client_vid = { client_vid }
+                and cm.milestone_type = 'ARRIVAL'
+            """)
+
+            if( cur.fetchone()[ 0 ] ):
+                raise HTTPException(
+                    status_code = 409,
+                    detail = "Client already has an arrival date"
+                )
+            
+            cur.execute(f"""
+                select to_char(cm.date, 'YYYY-MM-DD')
+                from main.client_milestone cm
+                where cm.client_vid = { client_vid }
+                and cm.milestone_type = 'DEPOSIT'
+            """)
+
+            deposit_date = cur.fetchone()
+
+            if( not deposit_date ):
+                raise HTTPException(
+                    status_code = 409,
+                    detail = "Client does not have a deposit date"
+                )
+
+            deposit_date = date.fromisoformat( deposit_date[ 0 ] )
+            timespan = arrival_date - deposit_date
+
+            risk_level = ""
+            if( timespan.days <= 60 ):
+                risk_level = "L_RISK"
+            elif( timespan.days <= 120 ):
+                risk_level = "M_RISK"
+            else:
+                risk_level = "H_RISK"
+
+            interactions = ""
+            i = 0
+            cont_date = arrival_date - timedelta( days = CONTACTS[ i ] )
+            while( cont_date > deposit_date ):
+                interactions += f"""
+                (
+                    { client_vid },
+                    '{ cont_date.strftime( "%Y-%m-%d" ) }',
+                    'Contacto { CONTACTS[ i ] } antes de llegada...',
+                    false
+                ), """
+
+                i += 1
+                cont_date = arrival_date - timedelta( days = CONTACTS[ i ] )
+
+            if( len( interactions ) ):
+                interactions = interactions[ : -2 ]
+
+            cur.execute(f"""
+                insert into main.client_milestone(
+                    client_vid,
+                    milestone_type,
+                    date
+                ) values(
+                    { client_vid },
+                    'ARRIVAL',
+                    '{ arrival_date.strftime( "%Y-%m-%d" ) }'
+                )
+            """)
+
+            cur.execute(f"""
+                insert into main.client_risk_level(
+                    client_vid,
+                    risk_level
+                ) values(
+                    { client_vid },
+                    '{ risk_level }'
+                )
+            """)
+
+            if( len( interactions ) ):
+                cur.execute(f"""
+                    insert into main.interaction(
+                        client_vid,
+                        inter_date,
+                        inter_desc,
+                        checked
+                    ) values { interactions }
+                """)
 
 
 @app.get( "/clients/milestones" )
@@ -56,344 +261,311 @@ def clients_milestones(
         
 
 def set_limits_for_year( year ):
-    jan = calendar.monthcalendar( year, 1 )
-    if( jan[ 0 ][ 0 ] ):
-        low = date(
-            year,
-            1,
-            jan[ 0 ][ 0 ]
-        )
-    else:
-        low = date(
-            year - 1,
-            12,
-            jan[ 1 ][ 0 ]
-        )
-    
-    dec = calendar.monthcalendar( year, 12 )
-    if( dec[ -1 ][ -1 ] ):
-        high = date(
-            year,
-            12,
-            dec[ -1 ][ -1 ]
-        )
-    else:
-        high = date(
-            year + 1,
-            1,
-            calendar.monthcalendar( year + 1, 1 )[ 0 ][ -1 ]
-        )
-    
-    return ( low, high )
+    return(
+        date( year, 1, 1 ),
+        date( year, 12, 31 )
+    )
 
 def set_limits_for_month( year, month ):
-    if( month == 1 ):
-        next = ( year, 2 )
-    elif( month == 12 ):
-        next = ( year + 1, 1 )
-    else:
-        next = ( year, month + 1 )
-
-    curr_month = calendar.monthcalendar( year, month )
-
-    if( curr_month[ 0 ][ 0 ] ):
-        low = date(
-            year,
-            month,
-            curr_month[ 0 ][ 0 ]
-        )
-    else:
-        low = date(
-            year,
-            month,
-            curr_month[ 1 ][ 0 ]
-        )
-    
-    if( curr_month[ -1 ][ -1 ] ):
-        high = date(
-            year,
-            month,
-            curr_month[ -1 ][ -1 ]
-        )
-    else:
-        high = date(
-            next[ 0 ],
-            next[ 1 ],
-            calendar.monthcalendar( next[ 0 ], next[ 1 ] )[ 0 ][ -1 ]
-        )
-    
-    return ( low, high )
+    return(
+        date( year, month, 1 ),
+        date( year, month, calendar.monthrange( year, month )[ 1 ] )
+    )
 
 def set_limits_for_week( year, month, week ):
-    week_days = calendar.monthcalendar( year, month )[ week ]
+    mc = calendar.monthcalendar( year, month )
 
-    if( week_days[ 0 ] ):
-        low = date( year, month, week_days[ 0 ] )
-        high = low + timedelta( days = 6 )
+    if( week == 0 and not mc[ 0 ][ 0 ] ):
+        if( month == 1 ):
+            prev_month = 12
+            prev_year = year - 1
+        else:
+            prev_month = month - 1
+            prev_year = year
+        low = date( prev_year, prev_month, calendar.monthcalendar( prev_year, prev_month )[ -1 ][ 0 ] )
     else:
-        if( week == 0 ):
-            if( month == 1 ):
-                year -= 1
-                month = 12
-                week = -1
+        low = date( year, month, mc[ week ][ 0 ] )
+
+    high = low + timedelta( days = 6 )
+    
+    return low, high
+
+def metrics_by_month( year, dchecks, dcounts ):
+    risk_levels = { rl: 0 for rl in [ "L_RISK", "M_RISK", "H_RISK" ] }
+    g_checks = risk_levels.copy()
+    g_counts = risk_levels.copy()
+    checks = { date( year, i, 1 ).isoformat(): risk_levels.copy() for i in range( 1, 13 ) }
+    counts = { date( year, i, 1 ).isoformat(): risk_levels.copy() for i in range( 1, 13 ) }
+
+    for row in dchecks:
+        g_checks[ row[ 1 ] ] += row[ 2 ]
+        checks[ row[ 0 ] ][ row[ 1 ] ] = row[ 2 ]
+    
+    for row in dcounts:
+        g_counts[ row[ 1 ] ] += row[ 2 ]
+        counts[ row[ 0 ] ][ row[ 1 ] ] = row[ 2 ]
+    
+    for rl in risk_levels.keys():
+            if( g_counts[ rl ] ):
+                g_checks[ rl ] = 100 * g_checks[ rl ] / g_counts[ rl ]
             else:
-                month -= 1
-                week = -1
+                g_checks[ rl ] = 100
+            g_checks[ rl ] = "{:.0f}".format( g_checks[ rl ] )
+
+    for month in checks.keys():
+        for rl in risk_levels.keys():
+            if( counts[ month ][ rl ] ):
+                checks[ month ][ rl ] = 100 * checks[ month ][ rl ] / counts[ month ][ rl ]
+            else:
+                checks[ month ][ rl ] = 100
+            checks[ month ][ rl ] = "{:.0f}".format( checks[ month ][ rl ] )
+    
+    return {
+        "global": { "counts": g_counts, "progress": g_checks },
+        "segments": {
+            "labels": MONTHS,
+            "counts": [ counts[ month ] for month in sorted( counts.keys() ) ],
+            "progress": [ checks[ month ] for month in sorted( checks.keys() ) ]
+        }
+    }
+
+def metrics_by_week( year, month, dchecks, dcounts ):
+    risk_levels = { rl: 0 for rl in [ "L_RISK", "M_RISK", "H_RISK" ] }
+    g_checks = risk_levels.copy()
+    g_counts = risk_levels.copy()
+    checks = {}
+    counts = {}
+
+    mc = calendar.monthcalendar( year, month )
+
+    i = 0
+
+    if( not mc[ 0 ][ 0 ] ):
+        if( month == 1 ):
+            prev_month = 12
+            prev_year = year - 1
         else:
-            week -=1
+            prev_month = month - 1
+            prev_year = year
+
+        week_date = date(
+            prev_year,
+            prev_month,
+            calendar.monthcalendar( prev_year, prev_month )[ -1 ][ 0 ]
+        ).strftime( "%Y-%m-%d" )
+
+        checks[ week_date ] = risk_levels.copy()
+        counts[ week_date ] = risk_levels.copy()
         
-        week_days = calendar.monthcalendar( year, month )[ week ]
+        i += 1
 
-        low = date( year, month, week_days[ 0 ] )
-        high = low + timedelta( days = 6 )
+    for i in range( i, len( mc ) ):
+        week_date = date( year, month, mc[ i ][ 0 ] ).strftime( "%Y-%m-%d" )
+        checks[ week_date ] = risk_levels.copy()
+        counts[ week_date ] = risk_levels.copy()
 
-    return ( low, high )
-
-# def build_dataset_for_year( data, year ):
-#     base = { "CONTACT": 0, "DEPOSIT": 0, "ARRIVAL": 0 }
-#     ds = { datetime( year, i, 1 ).strftime( "%Y-%m-%d" ): base for i in range( 1, 13 ) }
-
-#     for row in data:
-#         ds[ row[ 0 ].strftime( "%Y-%m-%d" ) ][ row[ 1 ] ] = row[ 2 ]
-
-#     return ds
-
-MONTHS = [
-    "Ene",
-    "Feb",
-    "Mar",
-    "Abr",
-    "May",
-    "Jun",
-    "Jul",
-    "Ago",
-    "Sep",
-    "Oct",
-    "Nov",
-    "Dic"
-]
-
-def build_dataset_for_year( data, year, filters ):
-    base = { "CONTACT": 0, "DEPOSIT": 0, "ARRIVAL": 0 }
-    ds = { datetime( year, i, 1 ).strftime( "%Y-%m-%d" ): base.copy() for i in range( 1, 13 ) }
-
-    for row in data:
-        ds[ row[ 0 ].strftime( "%Y-%m-%d" ) ][ row[ 1 ] ] = row[ 2 ]
+    for row in dchecks:
+        g_checks[ row[ 1 ] ] += row[ 2 ]
+        checks[ row[ 0 ] ][ row[ 1 ] ] = row[ 2 ]
     
-    labels = []
-    dsets_data = { f: [] for f in filters }
+    for row in dcounts:
+        g_counts[ row[ 1 ] ] += row[ 2 ]
+        counts[ row[ 0 ] ][ row[ 1 ] ] = row[ 2 ]
+    
+    for rl in risk_levels.keys():
+            if( g_counts[ rl ] ):
+                g_checks[ rl ] = 100 * g_checks[ rl ] / g_counts[ rl ]
+            else:
+                g_checks[ rl ] = 100
+            g_checks[ rl ] = "{:.0f}".format( g_checks[ rl ] )
 
-    for k in ds.keys():
-        labels.append( k )
-        for f in filters:
-            dsets_data[ f ].append( ds[ k ][ f ] )
-
+    for week in checks.keys():
+        for rl in risk_levels.keys():
+            if( counts[ week ][ rl ] ):
+                checks[ week ][ rl ] = 100 * checks[ week ][ rl ] / counts[ week ][ rl ]
+            else:
+                checks[ week ][ rl ] = 100
+            checks[ week ][ rl ] = "{:.0f}".format( checks[ week ][ rl ] )
+    
     return {
-        "labels": MONTHS,
-        "datasets": [
-            { "label": k, "data": dsets_data[ k ] } for k in dsets_data.keys()
-        ]
+        "global": { "counts": g_counts, "progress": g_checks },
+        "segments": {
+            "labels": [ f"S{ i }" for i in range( 1, len( counts.keys() ) + 1 ) ],
+            "counts": [ counts[ week ] for week in sorted( counts.keys() ) ],
+            "progress": [ checks[ week ] for week in sorted( checks.keys() ) ]
+        }
     }
 
-def build_dataset_for_month( data, year, month, filters ):
-    ds = {}
-
-    if( month == 1 ):
-        next = ( year, 2 )
-    elif( month == 12 ):
-        next = ( year + 1, 1 )
-    else:
-        next = ( year, month + 1 )
-    
-    curr_month = calendar.monthcalendar( year, month )
-
-    for i in range( 0, len( curr_month ) - 1 ):
-        if( curr_month[ i ][ 0 ] ):
-            ds[ date( year, month, curr_month[ i ][ 0 ] ).strftime( "%Y-%m-%d" ) ] = {
-                "CONTACT": 0,
-                "DEPOSIT": 0,
-                "ARRIVAL": 0
-            }
-        else:
-            ds[ date( year, month, curr_month[ i + 1 ][ 0 ] ).strftime( "%Y-%m-%d" ) ] = {
-                "CONTACT": 0,
-                "DEPOSIT": 0,
-                "ARRIVAL": 0
-            }
-
-    if( curr_month[ -1 ][ 0 ] ):
-        ds[ date( year, month, curr_month[ -1 ][ 0 ] ).strftime( "%Y-%m-%d" ) ] = {
-            "CONTACT": 0,
-            "DEPOSIT": 0,
-            "ARRIVAL": 0
-        }
-    else:
-        next_month = calendar.monthcalendar( next[ 0 ], next[ 1 ] )
-        ds[ date( next[ 0 ], next[ 1 ], next_month[ 0 ][ -1 ] ).strftime( "%Y-%m-%d" ) ] = {
-            "CONTACT": 0,
-            "DEPOSIT": 0,
-            "ARRIVAL": 0
-        }
-
-    for row in data:
-        ds[ row[ 0 ].strftime( "%Y-%m-%d" ) ][ row[ 1 ] ] = row[ 2 ]
-
-    labels = []
-    dsets_data = { f: [] for f in filters }
-
-    for k in ds.keys():
-        labels.append( k )
-        for f in filters:
-            dsets_data[ f ].append( ds[ k ][ f ] )
-
-    return {
-        "labels": [ f"S{ i }" for i in range( 1, len( labels ) + 1 ) ],
-        "datasets": [
-            { "label": k, "data": dsets_data[ k ] } for k in dsets_data.keys()
-        ]
-    }
-
-WEEK_DAYS = [
-    "Lun",
-    "Mar",
-    "Mie",
-    "Jue",
-    "Vie",
-    "Sab",
-    "Dom"
-]
-
-def build_dataset_for_week( data, year, month, week, filters ):
-    ds = {}
+def metrics_by_weekday( year, month, week, dchecks, dcounts ):
+    risk_levels = { rl: 0 for rl in [ "L_RISK", "M_RISK", "H_RISK" ] }
+    g_checks = risk_levels.copy()
+    g_counts = risk_levels.copy()
+    checks = {}
+    counts = {}
 
     l, _ = set_limits_for_week( year, month, week )
     for i in range( 0, 7 ):
-        ds[ ( l + timedelta( days = i * 1 ) ).strftime( "%Y-%m-%d" ) ] = {
-            "CONTACT": 0,
-            "DEPOSIT": 0,
-            "ARRIVAL": 0
-        }
+        checks[ ( l + timedelta( days = i * 1 ) ).strftime( "%Y-%m-%d" ) ] = risk_levels.copy()
+        counts[ ( l + timedelta( days = i * 1 ) ).strftime( "%Y-%m-%d" ) ] = risk_levels.copy()
 
-    for row in data:
-        ds[ row[ 0 ].strftime( "%Y-%m-%d" ) ][ row[ 1 ] ] = row[ 2 ]
+    for row in dchecks:
+        g_checks[ row[ 1 ] ] += row[ 2 ]
+        checks[ row[ 0 ] ][ row[ 1 ] ] = row[ 2 ]
+    
+    for row in dcounts:
+        g_counts[ row[ 1 ] ] += row[ 2 ]
+        counts[ row[ 0 ] ][ row[ 1 ] ] = row[ 2 ]
+    
+    for rl in risk_levels.keys():
+            if( g_counts[ rl ] ):
+                g_checks[ rl ] = 100 * g_checks[ rl ] / g_counts[ rl ]
+            else:
+                g_checks[ rl ] = 100
+            g_checks[ rl ] = "{:.0f}".format( g_checks[ rl ] )
 
-    labels = []
-    dsets_data = { f: [] for f in filters }
-
-    for k in ds.keys():
-        labels.append( k )
-        for f in filters:
-            dsets_data[ f ].append( ds[ k ][ f ] )
-
+    for weekday in checks.keys():
+        for rl in risk_levels.keys():
+            if( counts[ weekday ][ rl ] ):
+                checks[ weekday ][ rl ] = 100 * checks[ weekday ][ rl ] / counts[ weekday ][ rl ]
+            else:
+                checks[ weekday ][ rl ] = 100
+            checks[ weekday ][ rl ] = "{:.0f}".format( checks[ weekday ][ rl ] )
+    
     return {
-        "labels": WEEK_DAYS,
-        "datasets": [
-            { "label": k, "data": dsets_data[ k ] } for k in dsets_data.keys()
-        ]
+        "global": { "counts": g_counts, "progress": g_checks },
+        "segments": {
+            "labels": WEEKDAYS,
+            "counts": [ counts[ weekday ] for weekday in sorted( counts.keys() ) ],
+            "progress": [ checks[ weekday ] for weekday in sorted( checks.keys() ) ]
+        }
     }
 
-@app.get( "/interactions/count" )
+@app.get( "/metrics" )
 def interactions_count(
-    year: int = None,
+    year: int,
     month: int = None,
     week: int = None,
 
-    exc_cont: bool = False,
-    exc_dep: bool = False,
-    exc_arr: bool = False,
+    # exc_lr: bool = False,
+    # exc_mr: bool = False,
+    # exc_hr: bool = False,
 ):
-    if( not year ):
+    if( month == None and week != None ):
         raise HTTPException( status_code = 422 )
-    if( not month and week != None ):
+    if( month != None and ( month < 1 or month > 12 ) ):
         raise HTTPException( status_code = 422 )
     
-    next_year = year
     if( month and week != None ):
         l, h = set_limits_for_week( year, month, week )
         trunc = "day"
-        span = f"""
-            and i.inter_date >= '{ l }'
-            and i.inter_date <= '{ h }'
-        """
     elif( month ):
         l, h = set_limits_for_month( year, month )
         trunc = "week"
-        span = f"""
-            and i.inter_date >= '{ l }'
-            and i.inter_date <= '{ h }'
-        """
     else:
         trunc = "month"
         l, h = set_limits_for_year( year )
-        span = f"""
-            and i.inter_date >= '{ l }'
-            and i.inter_date <= '{ h }'
-        """
 
-    filters = []
-    if( not exc_cont ): filters.append( "CONTACT" )
-    if( not exc_dep ): filters.append( "DEPOSIT" )
-    if( not exc_arr ): filters.append( "ARRIVAL" )
+    # filters = []
+    # if( not exc_lr ): filters.append( "L_RISK" )
+    # if( not exc_mr ): filters.append( "M_RISK" )
+    # if( not exc_hr ): filters.append( "H_RISK" )
 
-    if( not len( filters ) ):
-        return { "labels": [], "datasets": [] }
+    # if( not len( filters ) ):
+    #     return { "labels": [], "datasets": [] }
 
-    filters_str = "(" + "".join( list( map( lambda e: f"'{ e }', ", filters ) ) )[ : -2 ] + ")"
+    # filters_str = "(" + "".join( list( map( lambda e: f"'{ e }', ", filters ) ) )[ : -2 ] + ")"
 
     with pg.connect( **CONN_ARGS ) as conn:
         with conn.cursor() as cur:
-            # print(f"""
-            #     select date_trunc('{ trunc }', i.inter_date) as { trunc }, i.milestone_type, count(*)
-            #     from main.interaction i
-            #     where i.milestone_type in { filters }
-            #     { span }
-            #     group by { trunc }
-            # """)
-
             cur.execute(f"""
-                select date_trunc('{ trunc }', i.inter_date) as { trunc }, i.milestone_type, count(*)
-                from main.interaction i
-                where i.milestone_type in { filters_str }
-                { span }
-                group by { trunc }, i.milestone_type
+                select to_char(date_trunc('{ trunc }', i.inter_date), 'YYYY-MM-DD') as { trunc }, crl.risk_level, count(*)
+                from main.interaction i, main.client c, main.client_risk_level crl
+                where i.client_vid = c.vid
+                and c.vid = crl.client_vid
+                and i.checked = true
+                and i.inter_date >= '{ l }'
+                and i.inter_date <= '{ h }'
+                group by { trunc }, crl.risk_level
                 order by { trunc }
             """)
 
+            checks = cur.fetchall()
+
+            cur.execute(f"""
+                select to_char(date_trunc('{ trunc }', i.inter_date), 'YYYY-MM-DD') as { trunc }, crl.risk_level, count(*)
+                from main.interaction i, main.client c, main.client_risk_level crl
+                where i.client_vid = c.vid
+                and c.vid = crl.client_vid
+                and i.inter_date >= '{ l }'
+                and i.inter_date <= '{ h }'
+                group by { trunc }, crl.risk_level
+                order by { trunc }
+            """)
+
+            counts = cur.fetchall()
+
             if( month != None and week != None ):
-                return build_dataset_for_week( cur.fetchall(), year, month, week, filters )
+                return metrics_by_weekday( year, month, week, checks, counts )
             elif( month != None ):
-                return build_dataset_for_month( cur.fetchall(), year, month, filters )
+                return metrics_by_week( year, month, checks, counts )
             else:
-                return build_dataset_for_year( cur.fetchall(), year, filters )
+                return metrics_by_month( year, checks, counts )
 
 
 @app.get( "/interactions" )
 def interactions(
-    year: int = None,
+    year: int,
     month: int = None,
     week: int = None,
     day: int = None,
 
-    exc_cont: bool = False,
-    exc_dep: bool = False,
-    exc_arr: bool = False,
+    exc_lr: bool = False,
+    exc_mr: bool = False,
+    exc_hr: bool = False,
 ):
-    if( not year ):
+    if( month == None and week != None ):
         raise HTTPException( status_code = 422 )
-    if( not month and week != None ):
+    if( ( month == None or week == None ) and day != None ):
         raise HTTPException( status_code = 422 )
-    if( ( not month or week == None ) and day != None ):
+    if( month != None and ( month < 1 or month > 12 ) ):
         raise HTTPException( status_code = 422 )
     
     if( month and week != None and day != None ):
         mc = calendar.monthcalendar( year, month )
-        if( mc[ week ][ 0 ] ):
-            md = mc[ week ][ day ]
-        else:
-            md = mc[ 1 ][ day ]
 
-        l = date( year, month, md )
-        h = l + timedelta( hours = 23, minutes = 59, seconds = 59 )
+        if( mc[ week ][ day ] == 0 ):
+            if( week == 0 ):
+                if( month == 1 ):
+                    prev_month = 12
+                    prev_year = year - 1
+                else:
+                    prev_month = month - 1
+                    prev_year = year        
+                
+                l = date(
+                    prev_year,
+                    prev_month,
+                    calendar.monthcalendar( prev_year, prev_month )[ -1 ][ day ]
+                )
+
+            else:
+                if( month == 12 ):
+                    next_month = 1
+                    next_year = year + 1
+                else:
+                    next_month = month + 1
+                    next_year = year
+
+                l = date(
+                    next_year,
+                    next_month,
+                    calendar.monthcalendar( next_year, next_month )[ 0 ][ day ]
+                )
+        
+        else:
+            l = date( year, month, mc[ week ][ day ] )
+        
+        h = l
 
     elif( month and week != None ):
         l, h = set_limits_for_week( year, month, week )
@@ -410,9 +582,9 @@ def interactions(
     """
 
     filters = []
-    if( not exc_cont ): filters.append( "CONTACT" )
-    if( not exc_dep ): filters.append( "DEPOSIT" )
-    if( not exc_arr ): filters.append( "ARRIVAL" )
+    if( not exc_lr ): filters.append( "L_RISK" )
+    if( not exc_mr ): filters.append( "M_RISK" )
+    if( not exc_hr ): filters.append( "H_RISK" )
 
     if( not len( filters ) ):
         return []
@@ -422,48 +594,64 @@ def interactions(
     with pg.connect( **CONN_ARGS ) as conn:
         with conn.cursor() as cur:
             # print(f"""
-            #     select date_trunc('{ trunc }', i.inter_date) as { trunc }, i.milestone_type, count(*)
-            #     from main.interaction i
-            #     where i.milestone_type in { filters }
+            #     select c.vid, c.name, c.lastname, c.email, c.cty_code, c.phone_num, crl.risk_level, to_char(i.inter_date, 'YYYY-MM-DD'), i.checked
+            #     from main.client c, main.client_risk_level crl, main.interaction i
+            #     where c.vid = crl.client_vid
+            #     and c.vid = i.client_vid
+            #     and crl.risk_level in { filters_str }
             #     { span }
-            #     group by { trunc }
             # """)
 
             cur.execute(f"""
-                select c.vid, c.name, c.phone_num, c.email, i.milestone_type, i.inter_date, i.inter_desc, i.checked
-                from main.client c, main.interaction i
-                where i.client_vid = c.vid
-                and i.milestone_type in { filters_str }
+                select c.vid, c.name, c.lastname, c.email, c.cty_code, c.phone_num, crl.risk_level, to_char(i.inter_date, 'YYYY-MM-DD'), i.checked
+                from main.client c, main.client_risk_level crl, main.interaction i
+                where c.vid = crl.client_vid
+                and c.vid = i.client_vid
+                and crl.risk_level in { filters_str }
                 { span }
             """)
 
-            ret = []
-            for row in cur.fetchall():
-                names = row[ 1 ].split()
-                ret.append({
-                    "client": {
-                        "vid": row[ 0 ],
-                        "name": names[ 0 ],
-                        "lastname": names[ 1 ],
-                        "phone": row[ 2 ],
-                        "email": row[ 3 ]
-                    },
-                    
-                    "interaction": {
-                        "milestone_type": row[ 4 ],
-                        "inter_date": row[ 5 ].strftime( "%Y-%m-%d" ),
-                        "inter_desc": row[ 6 ],
-                        "checked": row[ 7 ]
-                    }
-                })
+            ret = [{
+                "client": {
+                    "vid": row[ 0 ],
+                    "name": row[ 1 ],
+                    "lastname": row[ 2 ],
+                    "email": row[ 3 ],
+                    "cty_code": row[ 4 ],
+                    "phone_num": row[ 5 ],
+                    "risk_level": row[ 6 ]
+                },
+                "interaction": {
+                    "inter_date": row[ 7 ],
+                    "checked": row[ 8 ]
+                }
+            } for row in cur.fetchall() ]
 
             return ret
+
+
+class Interaction( BaseModel ):
+    client_vid: int
+    inter_date: str
+    inter_desc: str
+
+@app.post( "/interactions/create" )
+def create_interaction( interaction: Interaction ):
+    with pg.connect( **CONN_ARGS ) as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                insert into main.interaction(client_vid, inter_date, inter_desc, checked) values(
+                    { interaction.client_vid },
+                    '{ interaction.inter_date }',
+                    '{ interaction.inter_desc }',
+                    false
+                )
+            """)
 
 
 @app.post( "/interactions/checked/toogle" )
 def interactions_checked_toogle(
     client_vid: int,
-    milestone_type: str,
     inter_date: str
 ):
     with pg.connect( **CONN_ARGS ) as conn:
@@ -472,7 +660,6 @@ def interactions_checked_toogle(
                 update main.interaction
                 set checked = not checked
                 where interaction.client_vid = { client_vid }
-                and interaction.milestone_type = '{ milestone_type }'
                 and interaction.inter_date = '{ inter_date }'
                 returning checked
             """)
@@ -480,59 +667,14 @@ def interactions_checked_toogle(
             return { "new_value": cur.fetchone()[ 0 ] }
 
 
-# @app.get( "/client/{client_vid}/roadmap" )
-# def client_roadmap( client_vid: int ):
-#     with pg.connect( **CONN_ARGS ) as conn:
-#         with conn.cursor() as cur:
-#             cur.execute(f"""
-#                 select c.vid, c.name, c.phone_num, c.email, i.milestone_type, i.inter_date, i.inter_desc, i.checked
-#                 from main.client c, main.interaction i
-#                 where i.client_vid = c.vid
-#                 and i.client_vid = { client_vid }
-#             """)
-
-#             ret = []
-#             for row in cur.fetchall():
-#                 names = row[ 1 ].split()
-#                 ret.append({
-#                     "client": {
-#                         "vid": row[ 0 ],
-#                         "name": names[ 0 ],
-#                         "lastname": names[ 1 ],
-#                         "phone": row[ 2 ],
-#                         "email": row[ 3 ]
-#                     },
-                    
-#                     "interaction": {
-#                         "milestone_type": row[ 4 ],
-#                         "inter_date": row[ 5 ].strftime( "%Y-%m-%d" ),
-#                         "inter_desc": row[ 6 ],
-#                         "checked": row[ 7 ]
-#                     }
-#                 })
-
-#             return ret
-
-
 @app.get( "/client/{client_vid}/roadmap" )
 def client_roadmap( client_vid: int ):
-    def milestone_floors( ms_type ):
-        ret = 1
-
-        if( ms_type == "DEPOSIT" ):
-            ret = 2
-        elif( ms_type == "ARRIVAL" ):
-            ret = 3
-        
-        return ret
-
-
     with pg.connect( **CONN_ARGS ) as conn:
         with conn.cursor() as cur:
             datasets = { "CONTACT": [], "DEPOSIT": [], "ARRIVAL": [] }
 
             cur.execute(f"""
-                select c.vid, c.name, c.phone_num, c.email, i.milestone_type, to_char(i.inter_date, 'YYYY-MM-DD'), i.inter_desc, i.checked
+                select to_char(i.inter_date, 'YYYY-MM-DD'), i.inter_desc, i.checked
                 from main.client c, main.interaction i
                 where i.client_vid = c.vid
                 and i.client_vid = { client_vid }
@@ -542,68 +684,37 @@ def client_roadmap( client_vid: int ):
             interactions = cur.fetchall()
 
             cur.execute(f"""
-                select cm.client_vid, cm.milestone_type, to_char(cm.date, 'YYYY-MM-DD')
+                select to_char(cm.date, 'YYYY-MM-DD')
                 from main.client_milestone cm
                 where cm.client_vid = { client_vid }
                 order by cm.date
             """)
 
-            milestones = list( cur.fetchall() )
-
-            datasets[ "MILESTONE" ] = []
+            milestones = cur.fetchall()
+            dep_date = milestones[ 0 ][ 0 ]
+            arr_date = milestones[ 1 ][ 0 ]
 
             datasets = {
-                "CONTACT": [],
-                "DEPOSIT": [],
-                "ARRIVAL": [],
-                "MILESTONE": [],
+                "INTERACTIONS": [],
+                "MILESTONES": [ { "x": dep_date, "y": 1 } ]
             }
 
-            labels = []
+            labels = [ dep_date ]
 
-            i = 0
-            while( len( milestones ) and i < len( interactions ) ):
-                while(
-                    len( milestones ) and
-                    i < len( interactions ) and
-                    interactions[ i ][ 5 ] == milestones[ 0 ][ 2 ]
-                ):
-                    datasets[ interactions[ i ][ 4 ] ].append({
-                        "x": interactions[ i ][ 5 ],
-                        "y": milestone_floors( interactions[ i ][ 4 ] ),
-                        "info": { "comments": interactions[ i ][ 6 ] }
-                    })
-                    i += 1
-                
-                labels.append( milestones[ 0 ][ 2 ] )
-                datasets[ "MILESTONE" ].append( { "x": milestones[ 0 ][ 2 ], "y": 0 } )
-                milestones.pop( 0 )
+            for inter in interactions:
+                labels.append( inter[ 0 ] )
+                datasets[ "INTERACTIONS" ].append({
+                    "x": inter[ 0 ],
+                    "y": 1,
+                    "info": { "comments": inter[ 1 ] }
+                })
 
-                while(
-                    len( milestones ) and
-                    i < len( interactions ) and
-                    interactions[ i ][ 5 ] < milestones[ 0 ][ 2 ]
-                ):
-                    labels.append( interactions[ i ][ 5 ] )
-                    datasets[ interactions[ i ][ 4 ] ].append({
-                        "x": interactions[ i ][ 5 ],
-                        "y": milestone_floors( interactions[ i ][ 4 ] ),
-                        "info": { "comments": interactions[ i ][ 6 ] }
-                    })
-                    i += 1
 
-            if( i < len( interactions ) ):
-                for row in interactions[ i : ]:
-                    labels.append( row[ 5 ] )
-                    datasets[ row[ 4 ] ].append({
-                        "x": row[ 5 ],
-                        "y": milestone_floors( row[ 4 ] ),
-                        "info": { "comments": row[ 6 ] }
-                    })
-            else:
-                for row in milestones:
-                    labels.append( row[ 2 ] )
-                    datasets[ "MILESTONE" ].append( { "x": row[ 2 ], "y": 0 } )
+            labels.append( arr_date )
+            datasets[ "MILESTONES" ].append({
+                "x": arr_date,
+                "y": 1
+            })
 
             return {
                 "labels": labels,
@@ -614,40 +725,3 @@ def client_roadmap( client_vid: int ):
                     "pointHoverRadius": 9,
                 } for k in datasets.keys() ]
             }
-
-
-class MilestoneType( Enum ):
-    CONTACT = "CONTACT"
-    DEPOSIT = "DEPOSIT"
-    ARRIVAL = "ARRIVAL"
-
-class Interaction( BaseModel ):
-    client_vid: int
-    milestone_type: MilestoneType
-    inter_date: str
-    inter_desc: str
-
-@app.post( "/interactions/create" )
-def create_interaction( interaction: Interaction ):
-    with pg.connect( **CONN_ARGS ) as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"""
-                insert into main.interaction values(
-                    { interaction.client_vid },
-                    '{ interaction.milestone_type.value }',
-                    '{ interaction.inter_date }',
-                    '{ interaction.inter_desc }',
-                    false
-                )
-            """)
-
-
-@app.get( "/agents" )
-def agents():
-    with pg.connect( **CONN_ARGS ) as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"""
-                select * from main.agent
-            """)
-
-            return cur.fetchall()
